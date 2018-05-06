@@ -10,10 +10,12 @@
 #include <algorithm>
 #include <ctime>
 #include <gmp.h>
-#include <bitset> // TODO
 
-// TODO ... -Wall -Wextra -pedantic TODO pridat?, odebrat spousteni z make
 using namespace std;
+
+#define MILLER_RABIN_STEPS 20
+
+gmp_randstate_t rngState; // mpi rng (MT) state
 
 class Vars {
    public:
@@ -24,7 +26,7 @@ class Vars {
     mpz_t phi; // phi(n) = (p - 1) * (q - 1)
     mpz_t e; // e > 1  &&  e < phi(n)  &&  gcd(e, phi = 1
     mpz_t d;
-    gmp_randstate_t rngState; // mpi rng (MT) state
+    // tmp helper variables
     mpz_t tmpa; // helper vars for multiplicative inverse counting
     mpz_t tmpb; // helper vars for multiplicative inverse counting
     mpz_t tmps0; // helper vars for multiplicative inverse counting
@@ -35,7 +37,8 @@ Vars generateKey(Vars vars);
 Vars generatePandQ(Vars vars);
 void countMinPossibleOddPrimeValue(mpz_t* minValue, mpz_t* msbBits);
 void getRandomOddNumber(mpz_t* primeNumber, unsigned long bits, Vars vars);
-bool isOddNumberPrimeNumber(mpz_t *number);
+bool isPrimeNumberMillerRabin(mpz_t *number); // doesn't work properly, ignores many primes for unknown reasons, seems to work for more than 20 bit, but takes too long
+bool isOddNumberPrimeNumber(mpz_t *number); // checking primes by dividing all numbers step by step, too slow, works up to +-60 bits = 10 seconds, 50 bits or less = instant
 Vars findE(Vars vars);
 Vars obtainMultiplicativeInverse(Vars vars);
 void exitWithMsg(string message);
@@ -71,8 +74,8 @@ Vars generateKey(Vars vars) {
     // init random number generator
     srand(clock()); // init srand with proc tick count
     unsigned long seed = rand();
-    gmp_randinit_mt(vars.rngState);
-    gmp_randseed_ui(vars.rngState, seed);
+    gmp_randinit_mt(rngState);
+    gmp_randseed_ui(rngState, seed);
 
     // generate p and q values
     mpz_init(vars.p);
@@ -93,7 +96,7 @@ Vars generateKey(Vars vars) {
     mpz_init(vars.phi);
     mpz_mul(vars.phi, pMinusOne, qMinusOne);
 
-    // count e TODO
+    // count e
     mpz_init(vars.e);
     vars = findE(vars);
 
@@ -155,39 +158,102 @@ Vars generatePandQ(Vars vars) {
                 countMinPossibleOddPrimeValue(&minValue, &twoBitsShifted);
             }
         }
+        mpz_clear(twoBitsShifted); mpz_clear(minValue);
     } else {
         // odd length of key
         unsigned long bitsCount1 = vars.bits/2 + 1; // one number is 1 bit longer
         unsigned long bitsCount2 = vars.bits/2;
-        cout << bitsCount1 << " " << bitsCount2 << endl; // TODO
-        // prepare bit shifting, so the result N will have needed length
-        unsigned long twoBits = 3UL << bitsCount1-2; // one number is 1 bit longer
-        mpz_t twoBitsShifted1;
-        mpz_init(twoBitsShifted1);
-        mpz_set_ui(twoBitsShifted1, twoBits);
 
-        twoBits = 3UL << bitsCount2-2; // one number is 1 bit lonshorter
-        mpz_t twoBitsShifted2;
-        mpz_init(twoBitsShifted2);
-        mpz_set_ui(twoBitsShifted2, twoBits);
-
+        mpz_t lastBit; mpz_init(lastBit);
+        mpz_set_ui(lastBit, 1);
         // generate Q with two first bits set to 1, so final N will have first bit 1
-        getRandomOddNumber(&vars.p, bitsCount1, vars);
-        mpz_ior(vars.p, vars.p, twoBitsShifted1); // shift "1 1" to first two bits
+        mpz_urandomb(vars.p, rngState, bitsCount1);
+        mpz_setbit(vars.p, bitsCount1 - 1);
+        mpz_setbit(vars.p, bitsCount1 - 2); // shift "1 1" to first two bits
+        mpz_ior(vars.p, vars.p, lastBit);
         while (!isOddNumberPrimeNumber(&vars.p)) {
-            getRandomOddNumber(&vars.p, bitsCount1, vars);
-            mpz_ior(vars.p, vars.p, twoBitsShifted1); // shift "1 1" to first two bits
+            mpz_urandomb(vars.p, rngState, bitsCount1);
+            mpz_setbit(vars.p, bitsCount1 - 1);
+            mpz_setbit(vars.p, bitsCount1 - 2); // shift "1 1" to first two bits
+            mpz_ior(vars.p, vars.p, lastBit);
         }
-
+        
         // generate Q with two first bits set to 1, so final N will have first bit 1
-        getRandomOddNumber(&vars.q, bitsCount2, vars);
-        mpz_ior(vars.q, vars.q, twoBitsShifted2);
+        mpz_urandomb(vars.q, rngState, bitsCount1);
+        mpz_setbit(vars.q, bitsCount2 - 1);
+        mpz_setbit(vars.q, bitsCount2 - 2); // shift "1 1" to first two bits
+        mpz_ior(vars.q, vars.q, lastBit);
         while (!isOddNumberPrimeNumber(&vars.q)) {
-            getRandomOddNumber(&vars.q, bitsCount2, vars);
-            mpz_ior(vars.q, vars.q, twoBitsShifted2);
+            mpz_urandomb(vars.q, rngState, bitsCount2);
+            mpz_setbit(vars.q, bitsCount2 - 1);
+            mpz_setbit(vars.q, bitsCount2 - 2);
+            mpz_ior(vars.q, vars.q, lastBit);
         }
+        mpz_clear(lastBit);
     }
     return vars;
+}
+
+/* Milelr-rabin test, algorithm based on pseudocode from wikipedia */
+// TODO doesnt work properly, ignores many primes
+bool isPrimeNumberMillerRabin(mpz_t *number) {
+
+    mpz_t n; mpz_t d; mpz_t x; mpz_t a; mpz_t r; mpz_t s; mpz_t tmp; mpz_t mod; mpz_t tmp2; mpz_t nMinusOne;
+    mpz_init(n);
+    mpz_init(d);
+    mpz_init(x);
+    mpz_init(a);
+    mpz_init(r);
+    mpz_init(s);
+    mpz_init(tmp);
+    mpz_init(mod);
+    mpz_init(tmp2);
+    mpz_init(nMinusOne);
+    bool continueLoop = false;
+
+    mpz_set(n, *number);
+    mpz_set(tmp, *number);
+    mpz_sub_ui(tmp, tmp, 1); // n - 1
+    mpz_set(nMinusOne, tmp);
+    mpz_cdiv_r_ui (mod, tmp, 2);
+    mpz_set_ui(s, 0);
+    while (mpz_cmp_ui(mod, 0) == 0) {
+        mpz_div_ui(tmp, tmp, 2);
+        mpz_cdiv_r_ui(mod, tmp, 2);
+        mpz_add_ui(s, s, 1); // s ... (2 ^ s) * d
+    }
+    
+    // (2^s) * d ... d is modulo from previous cycle
+    mpz_abs(d, mod);
+    mpz_sub_ui(tmp2, nMinusOne, 3); // n - 4, used as random generator limit
+    for (unsigned long i=0; i < MILLER_RABIN_STEPS; i++) {
+        mpz_urandomm(a, rngState, tmp2); // gen 0 to n-4
+        mpz_add_ui(a, a, 2); // make it 2 to n-2
+        mpz_powm(x, a, d, n);
+        if ((mpz_cmp_ui(x, 1) == 0) || (mpz_cmp(x, nMinusOne) == 0)) {
+            continue;
+        }
+        
+        for (unsigned long j = 1; mpz_cmp_ui(s, j+1) > 0; j++) {
+            mpz_powm_ui(x, x, 2, n);
+            if (mpz_cmp_ui(x, 0) == 0) {
+                mpz_clear(n);mpz_clear(d);mpz_clear(x); mpz_clear(a);mpz_clear(r);mpz_clear(s);mpz_clear(tmp);mpz_clear(mod);mpz_clear(tmp2);mpz_clear(nMinusOne);
+                return false;
+            }
+            if (mpz_cmp(x, nMinusOne) == 0) {
+                continueLoop = true;
+                break;
+            }
+        }
+        if (continueLoop == true) {
+            continueLoop = false;
+            continue;
+        }
+        mpz_clear(n);mpz_clear(d);mpz_clear(x); mpz_clear(a);mpz_clear(r);mpz_clear(s);mpz_clear(tmp);mpz_clear(mod);mpz_clear(tmp2);mpz_clear(nMinusOne);
+        return false;
+    }
+    mpz_clear(n);mpz_clear(d);mpz_clear(x); mpz_clear(a);mpz_clear(r);mpz_clear(s);mpz_clear(tmp);mpz_clear(mod);mpz_clear(tmp2);mpz_clear(nMinusOne);
+    return true;
 }
 
 /* Count minimal possible value that a needed prime number P/Q can have for given bit length.
@@ -200,16 +266,18 @@ void countMinPossibleOddPrimeValue(mpz_t* minValue, mpz_t* msbBits) {
     mpz_ior(*minValue, *minValue, lastBit);
     // OR msbBits
     mpz_ior(*minValue, *minValue, *msbBits);
+    mpz_clear(lastBit);
 }
 
 /* Generate random odd number.*/
 void getRandomOddNumber(mpz_t* oddNumber, unsigned long bitsLength, Vars vars) {
-    mpz_urandomb(*oddNumber, vars.rngState, bitsLength);
+    mpz_urandomb(*oddNumber, rngState, bitsLength);
     // set last bit to 1 = odd number
     mpz_t lastBit;
     mpz_init(lastBit);
     mpz_set_ui(lastBit, 1);
     mpz_ior(*oddNumber, *oddNumber, lastBit);
+    mpz_clear(lastBit);
 }
 
 /*Check if given ODD number is a prime number.*/
@@ -235,9 +303,11 @@ bool isOddNumberPrimeNumber(mpz_t *number) {
     for(i; mpz_cmp(halfNumber, i) > 0; mpz_add_ui(i, i, 2)){
         mpz_cdiv_r(modulo, *number, i);
         if(mpz_cmp_ui(modulo, 0) == 0) {
+            mpz_clear(i);mpz_clear(halfNumber);mpz_clear(modulo);
             return false;
         } 
     }
+    mpz_clear(i);mpz_clear(halfNumber);mpz_clear(modulo);
     return true;
 }
 
@@ -256,13 +326,15 @@ void countGcd(mpz_t* gcd, mpz_t* x, mpz_t* y) {
     }
 
     mpz_set(*gcd, tmp2);
+
+    mpz_clear(mod); mpz_clear(tmp1); mpz_clear(tmp2);
 }
 
 
 /* Find e using Eucl. algorithm */
 Vars findE(Vars vars) {
     // gen random e <= phi
-    mpz_urandomm(vars.e, vars.rngState, vars.phi); // gen 0 to phi-1
+    mpz_urandomm(vars.e, rngState, vars.phi); // gen 0 to phi-1
     mpz_add_ui(vars.e, vars.e, 1); // make it 1 to phi
 
     // GCD is 1, the E is okay
@@ -280,6 +352,7 @@ Vars findE(Vars vars) {
             mpz_sub_ui(vars.e, vars.e, 1);
             countGcd(&gcd, &vars.e, &vars.phi);
             if (mpz_cmp_ui(gcd, 1) == 0) {
+                mpz_clear(tmp); mpz_clear(gcd);
                 return vars;
             }
         }
@@ -289,12 +362,15 @@ Vars findE(Vars vars) {
             mpz_add_ui(vars.e, vars.e, 1);
             countGcd(&gcd, &vars.e, &vars.phi);
             if (mpz_cmp_ui(gcd, 1) == 0) {
+                mpz_clear(tmp); mpz_clear(gcd);
                 return vars;
             }
         }
     }
+    
     // should not get here, but if yes, return 3 (given by a project definition)
     mpz_set_ui(vars.e, 3);
+    mpz_clear(gcd);
     return vars;
 }
 
@@ -330,6 +406,7 @@ Vars obtainMultiplicativeInverse(Vars vars) {
             mpz_mul(tmp, tmp4, tmp);
             mpz_sub(vars.tmps1, tmp3, tmp);
 
+            mpz_clear(tmp1); mpz_clear(tmp2); mpz_clear(tmp3); mpz_clear(tmp4); mpz_clear(tmp);
             return obtainMultiplicativeInverse(vars);
         }
 }
